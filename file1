@@ -1,0 +1,321 @@
+"""
+Climate-Sentiment-Analysis-from-Social-Media
+============================================
+
+A self-contained script that:
+- Generates synthetic social media posts about climate topics
+- Preprocesses text (cleaning, tokenization)
+- Vectorizes text with TF-IDF
+- Trains a classifier to predict sentiment (positive / neutral / negative)
+- Evaluates model and saves artifacts (CSV, model pickle)
+
+Run: python Climate-Sentiment-Analysis-from-Social-Media.py
+
+Dependencies (pip): scikit-learn, pandas, numpy, nltk, joblib, openpyxl, matplotlib
+"""
+
+from pathlib import Path
+import random
+import re
+import json
+import datetime
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.dummy import DummyClassifier
+import joblib
+
+# Optional: for nicer tokenization / stopwords
+try:
+    import nltk
+    from nltk.corpus import stopwords
+    from nltk.stem import SnowballStemmer
+    nltk_available = True
+except Exception:
+    nltk_available = False
+
+
+PROJECT_DIR = Path.cwd() / "climate_sentiment_project"
+PROJECT_DIR.mkdir(exist_ok=True)
+
+
+### 1) Synthetic data generator
+
+POSITIVE_PHRASES = [
+    "good progress",
+    "encouraging news",
+    "renewable success",
+    "climate action works",
+    "happy to see",
+    "great initiative",
+    "inspiring",
+    "hopeful",
+]
+
+NEGATIVE_PHRASES = [
+    "climate crisis",
+    "disaster",
+    "not enough",
+    "failed",
+    "angry",
+    "out of control",
+    "terrible",
+    "catastrophe",
+]
+
+NEUTRAL_PHRASES = [
+    "study shows",
+    "reports",
+    "data",
+    "updates",
+    "conference",
+    "policy discussion",
+]
+
+CLIMATE_KEYWORDS = [
+    "climate",
+    "global warming",
+    "emissions",
+    "carbon",
+    "renewable",
+    "solar",
+    "wind",
+    "sea level",
+    "flood",
+    "drought",
+    "policy",
+    "net-zero",
+]
+
+HASHTAGS = ["#climate", "#netzero", "#renewables", "#ActNow", "#ClimateAction"]
+MENTIONS = ["@GovUser", "@Scientist", "@NGO", "@NewsOrg"]
+EMOJIS_POS = ["🙂", "🌞", "🌱", "👍"]
+EMOJIS_NEG = ["😢", "🔥", "🌪️", "😡"]
+
+random.seed(42)
+np.random.seed(42)
+
+
+def generate_synthetic_post(sentiment: str) -> str:
+    """Generate a single synthetic social media post for the given sentiment.
+    sentiment: 'positive' | 'neutral' | 'negative'
+    """
+    base = []
+    # Add 1-2 climate keywords
+    n_kw = random.choice([1, 1, 2])
+    base += random.sample(CLIMATE_KEYWORDS, n_kw)
+
+    # Add sentiment phrase
+    if sentiment == "positive":
+        base.append(random.choice(POSITIVE_PHRASES))
+        if random.random() < 0.4:
+            base.append(random.choice(EMOJIS_POS))
+    elif sentiment == "negative":
+        base.append(random.choice(NEGATIVE_PHRASES))
+        if random.random() < 0.45:
+            base.append(random.choice(EMOJIS_NEG))
+    else:
+        base.append(random.choice(NEUTRAL_PHRASES))
+
+    # Add some context / filler
+    fillers = [
+        "We need action now",
+        "New study:",
+        "Experts warn",
+        "Local communities affected",
+        "Policy updates coming",
+        "Companies investing in",
+        "Cities planning for",
+    ]
+    if random.random() < 0.5:
+        base.append(random.choice(fillers))
+
+    # Add hashtags and mentions sometimes
+    if random.random() < 0.6:
+        base.append(random.choice(HASHTAGS))
+    if random.random() < 0.2:
+        base.append(random.choice(MENTIONS))
+
+    # Shuffle to make it less templated
+    random.shuffle(base)
+    text = " ".join(base)
+
+    # Randomly add punctuation/noise
+    if random.random() < 0.15:
+        text += "!!"
+    if random.random() < 0.1:
+        text = text.upper()
+
+    # Add a fake URL sometimes
+    if random.random() < 0.12:
+        text += " https://t.co/xyz"
+
+    return text
+
+
+def make_synthetic_dataset(n_samples=2000, pos_ratio=0.35, neg_ratio=0.35):
+    """Create a pandas DataFrame with synthetic posts and labels.
+    Labels: 'positive', 'neutral', 'negative'
+    """
+    n_pos = int(n_samples * pos_ratio)
+    n_neg = int(n_samples * neg_ratio)
+    n_neu = n_samples - n_pos - n_neg
+
+    rows = []
+    for _ in range(n_pos):
+        rows.append({"text": generate_synthetic_post("positive"), "label": "positive"})
+    for _ in range(n_neg):
+        rows.append({"text": generate_synthetic_post("negative"), "label": "negative"})
+    for _ in range(n_neu):
+        rows.append({"text": generate_synthetic_post("neutral"), "label": "neutral"})
+
+    random.shuffle(rows)
+    df = pd.DataFrame(rows)
+    # Add metadata
+    df["created_at"] = pd.date_range(end=pd.Timestamp.now(), periods=len(df)).astype(str)
+    df["id"] = [f"synth_{i}" for i in range(len(df))]
+    return df
+
+
+### 2) Simple text preprocessing
+
+URL_RE = re.compile(r"https?://\S+")
+MENTION_RE = re.compile(r"@\w+")
+HASHTAG_RE = re.compile(r"#\w+")
+NON_ALPHANUM = re.compile(r"[^\w\s\u00C0-\u017F]")  # keep unicode letters
+
+
+def preprocess_text(s: str, do_stem=False) -> str:
+    s = s.lower()
+    s = URL_RE.sub("", s)
+    s = MENTION_RE.sub("", s)
+    # keep hashtags as tokens but remove # symbol
+    s = HASHTAG_RE.sub(lambda m: m.group(0)[1:], s)
+    s = NON_ALPHANUM.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    if nltk_available and do_stem:
+        try:
+            stemmer = SnowballStemmer("english")
+            tokens = [stemmer.stem(t) for t in s.split() if t not in stopwords.words("english")]
+            return " ".join(tokens)
+        except Exception:
+            pass
+
+    return s
+
+
+### 3) Build pipeline, train and evaluate
+
+
+def train_and_evaluate(df: pd.DataFrame, model_path: Path = PROJECT_DIR / "model.joblib"):
+    X = df["text"].map(lambda t: preprocess_text(t))
+    y = df["label"]
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
+
+    pipeline = Pipeline([
+        ("tfidf", TfidfVectorizer(ngram_range=(1,2), max_features=5000, min_df=2)),
+        ("clf", LogisticRegression(max_iter=1000))
+    ])
+
+    # Quick grid search for C
+    param_grid = {"clf__C": [0.1, 1.0, 5.0]}
+    gs = GridSearchCV(pipeline, param_grid, cv=3, scoring="f1_macro", n_jobs=-1)
+    gs.fit(X_train, y_train)
+
+    best = gs.best_estimator_
+    y_pred = best.predict(X_test)
+
+    acc = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred, digits=4)
+    cm = confusion_matrix(y_test, y_pred, labels=["positive","neutral","negative"]) 
+
+    # Save model and artifacts
+    joblib.dump(best, model_path)
+
+    return {
+        "accuracy": acc,
+        "report": report,
+        "confusion_matrix": cm,
+        "best_params": gs.best_params_,
+        "model_path": str(model_path)
+    }
+
+
+### 4) Utilities: save dataset, sample predictions
+
+
+def save_dataset(df: pd.DataFrame, filename: Path = PROJECT_DIR / "synthetic_posts.xlsx"):
+    df.to_excel(filename, index=False)
+    return filename
+
+
+def sample_predictions(model_path: Path, texts, n=10):
+    model = joblib.load(model_path)
+    cleaned = [preprocess_text(t) for t in texts]
+    preds = model.predict(cleaned)
+    probs = None
+    try:
+        probs = model.predict_proba(cleaned)
+    except Exception:
+        pass
+    return list(zip(texts, preds, probs))
+
+
+### 5) Main execution
+
+
+def main():
+    print("Generating synthetic dataset...")
+    df = make_synthetic_dataset(n_samples=3000, pos_ratio=0.33, neg_ratio=0.33)
+    csv_path = PROJECT_DIR / "synthetic_posts.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"Saved synthetic CSV to: {csv_path}")
+
+    print("Saving Excel version...")
+    excel_path = save_dataset(df, PROJECT_DIR / "synthetic_posts.xlsx")
+    print(f"Saved Excel to: {excel_path}")
+
+    print("Training model (this may take a minute)...")
+    results = train_and_evaluate(df)
+    print("Training complete.")
+    print(f"Accuracy on test set: {results['accuracy']:.4f}")
+    print("Best params:", results["best_params"]) 
+    print("Classification report:\n", results["report"]) 
+    print("Confusion matrix:\n", results["confusion_matrix"])
+
+    # Save a tiny metadata JSON
+    meta = {
+        "trained_at": datetime.datetime.now().isoformat(),
+        "n_samples": len(df),
+        "model_path": results["model_path"],
+        "accuracy": results["accuracy"],
+        "best_params": results["best_params"]
+    }
+    with open(PROJECT_DIR / "metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    # Show some sample predictions
+    sample_texts = [
+        "New solar farm announced, great initiative for renewable energy! #renewables",
+        "Sea levels rising — this is a catastrophe and nobody is doing enough.",
+        "Study shows emissions peaked last year, more details in the report.",
+        "Hopeful about the new policy, inspiring change ahead!",
+    ]
+    preds = sample_predictions(Path(results["model_path"]), sample_texts)
+    print("Sample predictions:")
+    for text, pred, prob in preds:
+        print(f"-> {pred}\t{text}")
+
+    print(f"Project artifacts saved to: {PROJECT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
